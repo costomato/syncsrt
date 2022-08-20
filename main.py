@@ -2,12 +2,13 @@ from os import linesep, remove
 from os.path import exists
 from sys import argv
 from time import sleep
-from typing import Any
 import wave
 import azure.cognitiveservices.speech as speechsdk
 import helper
 import os
 from dotenv import load_dotenv
+from syncsrt.media.extract import extract
+from syncsrt.subtitle.srt import srt
 load_dotenv()
 
 def user_config_from_args(usage : str) -> helper.Read_Only_Dict :
@@ -18,13 +19,22 @@ def user_config_from_args(usage : str) -> helper.Read_Only_Dict :
     if region is None:
         raise RuntimeError("Missing region.{}{}".format(linesep, usage))
         
+    input_file = helper.get_cmd_option("--input")
+    if not input_file.endswith('.wav'):
+        print("File not in wav format. Extracting to wav audio...")
+        ext = extract()
+        ext.convert_video_to_audio_ffmpeg(input_file, '00:00:00', '00:30:00')
+        input_file = input_file[:input_file.rindex('.')]
+        input_file += '.wav'
+        print("Wav extraction finished.")
+
     return helper.Read_Only_Dict({
         "use_compressed_audio" : helper.cmd_option_exists("--format"),
         "compressed_audio_format" : helper.get_compressed_audio_format(),
         "profanity_option" : helper.get_profanity_option(),
         "suppress_console_output" : helper.cmd_option_exists("--quiet"),
         "use_sub_rip_text_caption_format" : helper.cmd_option_exists("--srt"),
-        "input_file" : helper.get_cmd_option("--input"),
+        "input_file" : input_file,
         "output_file" : helper.get_cmd_option("--output"),
         "language_ID_languages" : helper.get_cmd_option("--languages"),
         "phrase_list" : helper.get_cmd_option("--phrases"),
@@ -32,6 +42,7 @@ def user_config_from_args(usage : str) -> helper.Read_Only_Dict :
         "stable_partial_result_threshold" : helper.get_cmd_option("--threshold"),
         "subscription_key" : key,
         "region" : region,
+        "repair_file": helper.get_cmd_option("--repair"),
     })
 
 # Note: Continuous language identification is supported only with v2 endpoints.
@@ -185,9 +196,66 @@ def recognize_continuous(speech_recognizer : speechsdk.SpeechRecognizer, user_co
         sleep(5)
     speech_recognizer.stop_continuous_recognition()
 
+def get_first_speech(speech_recognizer : speechsdk.SpeechRecognizer, user_config : helper.Read_Only_Dict, format : speechsdk.audio.AudioStreamFormat, callback : helper.BinaryFileReaderCallback, stream : speechsdk.audio.PullAudioInputStream) :
+    done = False
+    caption = ""
+
+    def recognized_handler(e : speechsdk.SpeechRecognitionEventArgs) :
+        nonlocal done
+        nonlocal caption
+        if speechsdk.ResultReason.RecognizedSpeech == e.result.reason and len(e.result.text) > 0 :
+            if not done: 
+                caption = caption_from_speech_recognition_result(sequence_number = 0, result = e.result, user_config = user_config)
+                caption = caption[:caption.find(" -->")]
+
+                print(caption)
+                done = True
+
+        elif speechsdk.ResultReason.NoMatch == e.result.reason :
+            helper.write_to_console(text = "NOMATCH: Speech could not be recognized.{}".format(linesep), user_config = user_config)
+
+    def canceled_handler(e : speechsdk.SpeechRecognitionCanceledEventArgs) :
+        nonlocal done
+        if speechsdk.CancellationReason.EndOfStream == e.cancellation_details.reason :
+            helper.write_to_console(text = "End of stream reached.{}".format(linesep), user_config = user_config)
+            done = True
+        elif speechsdk.CancellationReason.CancelledByUser == e.cancellation_details.reason :
+            helper.write_to_console(text = "User canceled request.{}".format(linesep), user_config = user_config)
+            done = True
+        elif speechsdk.CancellationReason.Error == e.cancellation_details.reason :
+            # Error output should not be suppressed, even if suppress output flag is set.
+            print("Encountered error. Cancellation details: {}{}".format(e.cancellation_details, linesep))
+            done = True
+        else :
+            print("Request was cancelled for an unrecognized reason. Cancellation details: {}{}".format(e.cancellation_details, linesep))
+            done = True
+
+    def stopped_handler(e : speechsdk.SessionEventArgs) :
+        nonlocal done
+        helper.write_to_console(text = "Session stopped.{}".format(linesep), user_config = user_config)
+        done = True
+
+    speech_recognizer.recognized.connect(recognized_handler)
+    speech_recognizer.session_stopped.connect(stopped_handler)
+    speech_recognizer.canceled.connect(canceled_handler)
+
+    speech_recognizer.start_continuous_recognition()
+
+    while not done :
+        sleep(.5)
+    speech_recognizer.stop_continuous_recognition()
+    os.remove(user_config['input_file'])
+    return caption
+
+def repair_srt(srt_path: str, first_speech: str):
+    s = srt(srt_path)
+    fs = s.create_delta(first_speech)
+    fd = s.get_first_timestamp_delta()
+    s.shift_srt(fs-fd)
+    s.output_srt()
 
 if __name__ == "__main__" :
-    usage = """Usage: python captioning.py [...]
+    usage = """Usage:
 
     HELP
         --help                        Show this help and stop.
@@ -202,6 +270,9 @@ if __name__ == "__main__" :
                                     If this is not present, uncompressed format (wav) is assumed.
                                     Valid only with --file.
                                     Valid values: alaw, any, flac, mp3, mulaw, ogg_opus
+
+    REPAIR SRT
+        --repair FILE                 Repair SRT file. (Requires input media file)
 
     RECOGNITION
         --recognizing                 Output Recognizing results (default output is Recognized results only.)
@@ -221,12 +292,19 @@ if __name__ == "__main__" :
     """
 
     try :
-        if helper.cmd_option_exists("--help") :
+        if helper.cmd_option_exists("--help") or len(argv) == 1:
             print(usage)
-        else :
+        elif helper.cmd_option_exists("--repair") :
+            user_config = user_config_from_args(usage)
+            initialize(user_config = user_config)
+            speech_recognizer_data = speech_recognizer_from_user_config(user_config = user_config)
+            fs = get_first_speech(speech_recognizer = speech_recognizer_data["speech_recognizer"], user_config = user_config, format = speech_recognizer_data["audio_stream_format"], callback = speech_recognizer_data["pull_input_audio_stream_callback"], stream = speech_recognizer_data["pull_input_audio_stream"])
+            repair_srt(srt_path = user_config['repair_file'], first_speech = fs)
+        else:
             user_config = user_config_from_args(usage)
             initialize(user_config = user_config)
             speech_recognizer_data = speech_recognizer_from_user_config(user_config = user_config)
             recognize_continuous(speech_recognizer = speech_recognizer_data["speech_recognizer"], user_config = user_config, format = speech_recognizer_data["audio_stream_format"], callback = speech_recognizer_data["pull_input_audio_stream_callback"], stream = speech_recognizer_data["pull_input_audio_stream"])
+
     except Exception as e:
         print(e)
